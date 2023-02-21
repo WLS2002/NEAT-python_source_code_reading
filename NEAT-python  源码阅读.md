@@ -1,3 +1,5 @@
+
+
 # NEAT-python  源码阅读
 
 ## 代码结构
@@ -1130,3 +1132,803 @@ def get_pruned_genes(node_genes, connection_genes, input_keys, output_keys):
 ```
 
 今天就到这。
+
+### stagnation
+
+本来在看reproduction的，突然发现这段代码完全没看。晕
+
+```python
+class DefaultStagnation(DefaultClassConfig):
+    """Keeps track of whether species are making progress and helps remove ones that are not."""
+
+    @classmethod
+    def parse_config(cls, param_dict):
+        return DefaultClassConfig(param_dict,
+                                  [ConfigParameter('species_fitness_func', str, 'mean'),
+                                   ConfigParameter('max_stagnation', int, 15),
+                                   ConfigParameter('species_elitism', int, 0)])
+
+    def __init__(self, config, reporters):
+        # pylint: disable=super-init-not-called
+        self.stagnation_config = config
+
+        # min, max, mean, median之类的
+        self.species_fitness_func = stat_functions.get(config.species_fitness_func)
+        
+        if self.species_fitness_func is None:
+            raise RuntimeError(
+                "Unexpected species fitness func: {0!r}".format(config.species_fitness_func))
+
+        self.reporters = reporters
+
+    def update(self, species_set, generation):
+        """
+        Required interface method. Updates species fitness history information,
+        checking for ones that have not improved in max_stagnation generations,
+        and - unless it would result in the number of species dropping below the configured
+        species_elitism parameter if they were removed,
+        in which case the highest-fitness species are spared -
+        returns a list with stagnant species marked for removal.
+        """
+        species_data = []
+        for sid, s in species_set.species.items():
+            if s.fitness_history:
+                prev_fitness = max(s.fitness_history)
+            else:
+                prev_fitness = -sys.float_info.max
+
+            s.fitness = self.species_fitness_func(s.get_fitnesses())  # 从物种里每个个体的分数计算出物种的分数
+            s.fitness_history.append(s.fitness)
+            s.adjusted_fitness = None
+            if prev_fitness is None or s.fitness > prev_fitness:
+                s.last_improved = generation
+
+            species_data.append((sid, s))
+
+        # Sort in ascending fitness order.
+        species_data.sort(key=lambda x: x[1].fitness)  # 根据物种的fitness将(sid, s)排序
+
+        result = []
+        species_fitnesses = []  # 好像完全没有用，笑了
+        num_non_stagnant = len(species_data)
+        for idx, (sid, s) in enumerate(species_data):
+            # Override stagnant state if marking this species as stagnant would
+            # result in the total number of species dropping below the limit.
+            # Because species are in ascending fitness order, less fit species
+            # will be marked as stagnant first.
+            stagnant_time = generation - s.last_improved  # 停滞时间
+            is_stagnant = False
+            if num_non_stagnant > self.stagnation_config.species_elitism:  # 物种数量有上限限制？
+                is_stagnant = stagnant_time >= self.stagnation_config.max_stagnation  # 停滞太长的就滚
+
+            if (len(species_data) - idx) <= self.stagnation_config.species_elitism:  # 后排分高的一定不会停滞
+                is_stagnant = False
+
+            if is_stagnant:
+                num_non_stagnant -= 1
+
+            result.append((sid, s, is_stagnant))
+            species_fitnesses.append(s.fitness)
+
+        return result
+```
+
+### reproduiction
+
+用于不断生成新的genome
+
+2023/2/20 
+
+昨晚4点才睡的，现在是上午10点，精神状态有点差
+
+希望上午能把这段看完。下午再看population，看完就全看完了。
+
+```python
+class DefaultReproduction(DefaultClassConfig):
+    """
+    Implements the default NEAT-python reproduction scheme:
+    explicit fitness sharing with fixed-time species stagnation.
+    """
+
+    @classmethod
+    def parse_config(cls, param_dict):
+        return DefaultClassConfig(param_dict,
+                                  [ConfigParameter('elitism', int, 0),
+                                   ConfigParameter('survival_threshold', float, 0.2),
+                                   ConfigParameter('min_species_size', int, 1)])
+
+    def __init__(self, config, reporters, stagnation):
+        # pylint: disable=super-init-not-called
+        self.reproduction_config = config
+        self.reporters = reporters
+        self.genome_indexer = count(1)  # 基因的key
+        self.stagnation = stagnation  # 停滯？
+        self.ancestors = {}
+
+    def create_new(self, genome_type, genome_config, num_genomes):  # 还有其他的genome_type吗，好像就一个default呀
+        new_genomes = {}
+        for i in range(num_genomes):
+            key = next(self.genome_indexer)
+            g = genome_type(key)
+            g.configure_new(genome_config)
+            new_genomes[key] = g
+            self.ancestors[key] = tuple()  # 第一批人 没有祖先，合理的
+
+        return new_genomes
+	
+    # 这段看的有点迷惑，也不知道论文在哪里这么说了
+    @staticmethod
+    def compute_spawn(adjusted_fitness, previous_sizes, pop_size, min_species_size):
+        # 计算出新一代每一个物种里的个体数量
+        """Compute the proper number of offspring per species (proportional to fitness)."""
+        af_sum = sum(adjusted_fitness)
+
+        spawn_amounts = []
+        for af, ps in zip(adjusted_fitness, previous_sizes):
+            if af_sum > 0:
+                s = max(min_species_size, af / af_sum * pop_size)  # adjusted_fitness所占的比重。同时控制下界
+            else:
+                s = min_species_size
+			
+            d = (s - ps) * 0.5  # 种群大小渐进变化，而不是一步变到s
+            c = int(round(d))
+            spawn = ps
+            if abs(c) > 0:
+                spawn += c
+            elif d > 0:
+                spawn += 1
+            elif d < 0:
+                spawn -= 1
+			# d == 0，则不变是吧
+            
+            spawn_amounts.append(spawn)
+
+        # Normalize the spawn amounts so that the next generation is roughly
+        # the population size requested by the user.
+        total_spawn = sum(spawn_amounts)
+        norm = pop_size / total_spawn  # 还需要归一化，控制pop_size
+        spawn_amounts = [max(min_species_size, int(round(n * norm))) for n in spawn_amounts]
+
+        return spawn_amounts
+
+    def reproduce(self, config, species, pop_size, generation):
+        """
+        Handles creation of genomes, either from scratch or by sexual or
+        asexual reproduction from parents.
+        """
+        # TODO: I don't like this modification of the species and stagnation objects,
+        # because it requires internal knowledge of the objects.
+
+        # Filter out stagnated species, collect the set of non-stagnated
+        # species members, and compute their average adjusted fitness.
+        # The average adjusted fitness scheme (normalized to the interval
+        # [0, 1]) allows the use of negative fitness values without
+        # interfering with the shared fitness scheme.
+        all_fitnesses = []
+        remaining_species = []
+        
+        # stagnant同来判断物种是否停滞。分数很多代没有增长就是停滞
+        for stag_sid, stag_s, stagnant in self.stagnation.update(species, generation):
+            if stagnant:
+                self.reporters.species_stagnant(stag_sid, stag_s)
+            else:
+                all_fitnesses.extend(m.fitness for m in stag_s.members.values())
+                remaining_species.append(stag_s)
+        # The above comment was not quite what was happening - now getting fitnesses
+        # only from members of non-stagnated species.
+
+        # No species left.
+        if not remaining_species:
+            species.species = {}
+            return {}  # was []
+
+        # Find minimum/maximum fitness across the entire population, for use in
+        # species adjusted fitness computation.
+        min_fitness = min(all_fitnesses)
+        max_fitness = max(all_fitnesses)
+        # Do not allow the fitness range to be zero, as we divide by it below.
+        # TODO: The ``1.0`` below is rather arbitrary, and should be configurable.
+        fitness_range = max(1.0, max_fitness - min_fitness)
+        for afs in remaining_species:
+            # Compute adjusted fitness.
+            msf = mean([m.fitness for m in afs.members.values()])  # 这里是直接取mean了
+            af = (msf - min_fitness) / fitness_range # 压缩到0-1之间？
+            afs.adjusted_fitness = af
+
+        adjusted_fitnesses = [s.adjusted_fitness for s in remaining_species]
+        avg_adjusted_fitness = mean(adjusted_fitnesses)  # type: float
+        self.reporters.info("Average adjusted fitness: {:.3f}".format(avg_adjusted_fitness))
+
+        # Compute the number of new members for each species in the new generation.
+        previous_sizes = [len(s.members) for s in remaining_species]
+        min_species_size = self.reproduction_config.min_species_size
+        # Isn't the effective min_species_size going to be max(min_species_size,
+        # self.reproduction_config.elitism)? That would probably produce more accurate tracking
+        # of population sizes and relative fitnesses... doing. TODO: document.
+        min_species_size = max(min_species_size, self.reproduction_config.elitism)
+        spawn_amounts = self.compute_spawn(adjusted_fitnesses, previous_sizes,
+                                           pop_size, min_species_size)
+        
+        # 获取新的物种大小
+        new_population = {}
+        species.species = {}
+        for spawn, s in zip(spawn_amounts, remaining_species):
+            # If elitism is enabled, each species always at least gets to retain its elites.
+            spawn = max(spawn, self.reproduction_config.elitism)
+
+            assert spawn > 0
+
+            # The species has at least one member for the next generation, so retain it.
+            old_members = list(s.members.items())
+            s.members = {}
+            species.species[s.key] = s
+
+            # Sort members in order of descending fitness.
+            old_members.sort(reverse=True, key=lambda x: x[1].fitness)  # 从大到小排序
+
+            # Transfer elites to new generation.
+            if self.reproduction_config.elitism > 0:
+                for i, m in old_members[:self.reproduction_config.elitism]:  # 保留前几个分高的
+                    new_population[i] = m
+                    spawn -= 1
+			
+            if spawn <= 0: 
+            continue
+    		# 上面的代码是先把精英保留下来，直接放到下一代
+            
+            # Only use the survival threshold fraction to use as parents for the next generation.
+            repro_cutoff = int(math.ceil(self.reproduction_config.survival_threshold *
+                                         len(old_members)))  # 只需要分比较高的人作为父母繁衍
+            # Use at least two parents no matter what the threshold fraction result is.
+            repro_cutoff = max(repro_cutoff, 2)
+            old_members = old_members[:repro_cutoff]
+			
+            # Randomly choose parents and produce the number of offspring allotted to the species.
+            while spawn > 0:
+                spawn -= 1
+
+                parent1_id, parent1 = random.choice(old_members)  # 完全随机选，跟分数无关，甚至不考虑会不会重复
+                parent2_id, parent2 = random.choice(old_members)
+
+                # Note that if the parents are not distinct, crossover will produce a
+                # genetically identical clone of the parent (but with a different ID).  # 父母就是可以一样。生一个一样的孩子
+                gid = next(self.genome_indexer)
+                child = config.genome_type(gid)  # 创建一个child对象，然后调用它的crossover方法
+                child.configure_crossover(parent1, parent2, config.genome_config)
+                child.mutate(config.genome_config)  # 新人要突变
+                # TODO: if config.genome_config.feed_forward, no cycles should exist
+                new_population[gid] = child
+                self.ancestors[gid] = (parent1_id, parent2_id)  # 记录下祖先，虽然不知道这个祖先有啥用
+
+        return new_population
+
+```
+
+### species
+
+物种，NEAT中的核心概念。前面已经有了判断两个基因组距离的方法，这里从不同距离来划分物种。
+
+"Divides the population into species based on genomic distances."
+
+关于这一部分，论文里提到的划分物种的方法是这样的：
+
+![image-20230217103630822](C:\Users\wls\AppData\Roaming\Typora\typora-user-images\image-20230217103630822.png)
+
+希望能找到对应的代码
+
+```python
+class Species(object):
+    def __init__(self, key, generation):  # generation是一个int，表示物种是在哪一代创建的
+        self.key = key
+        self.created = generation
+        self.last_improved = generation
+        self.representative = None  # 物种的代表genome
+        self.members = {}           # 成员
+        self.fitness = None
+        self.adjusted_fitness = None
+        self.fitness_history = []
+
+    def update(self, representative, members):
+        self.representative = representative
+        self.members = members
+
+    def get_fitnesses(self):
+        return [m.fitness for m in self.members.values()]
+    
+# 一个物种，species不可数（好奇怪）
+```
+
+```python
+class GenomeDistanceCache(object):
+    def __init__(self, config):
+        self.distances = {}
+        self.config = config
+        self.hits = 0
+        self.misses = 0
+
+    def __call__(self, genome0, genome1):
+        g0 = genome0.key
+        g1 = genome1.key
+        d = self.distances.get((g0, g1))
+        if d is None:
+            # Distance is not already computed.
+            d = genome0.distance(genome1, self.config)
+            self.distances[g0, g1] = d
+            self.distances[g1, g0] = d
+            self.misses += 1
+        else:
+            self.hits += 1
+
+        return d
+# Cache
+```
+
+直接看代码
+
+```python
+class DefaultSpeciesSet(DefaultClassConfig):  # 好多个species
+    """ Encapsulates the default speciation scheme. """
+
+    def __init__(self, config, reporters):
+        # pylint: disable=super-init-not-called
+        self.species_set_config = config
+        self.reporters = reporters
+        self.indexer = count(1)
+        self.species = {}  # 刚开始没有物种，合理的
+        self.genome_to_species = {}
+
+    @classmethod
+    def parse_config(cls, param_dict):
+        return DefaultClassConfig(param_dict,
+                                  [ConfigParameter('compatibility_threshold', float)])
+
+    def speciate(self, config, population, generation):  # population: dict(key -> genome)，generation: int
+        """
+        Place genomes into species by genetic similarity.
+
+        Note that this method assumes the current representatives of the species are from the old
+        generation, and that after speciation has been performed, the old representatives should be
+        dropped and replaced with representatives from the new generation.  If you violate this
+        assumption, you should make sure other necessary parts of the code are updated to reflect
+        the new behavior.
+        """
+        assert isinstance(population, dict)
+
+        compatibility_threshold = self.species_set_config.compatibility_threshold
+
+        # Find the best representatives for each existing species.
+        unspeciated = set(population)
+        distances = GenomeDistanceCache(config.genome_config)
+        new_representatives = {}
+        new_members = {}
+        for sid, s in self.species.items():
+            candidates = []
+            for gid in unspeciated:
+                g = population[gid]
+                d = distances(s.representative, g)
+                candidates.append((d, g))
+
+            # The new representative is the genome closest to the current representative.
+            ignored_rdist, new_rep = min(candidates, key=lambda x: x[0])
+            new_rid = new_rep.key
+            new_representatives[sid] = new_rid
+            new_members[sid] = [new_rid]
+            unspeciated.remove(new_rid)
+            
+		# 每一代的物种里，都有一个representative genome用来代表这个物种。上一代的representative genome可能已经被演化整不一样了
+        # 所以要从这一带所有人里面找一个和那个人最像的，来作为这一带该物种的representative genome。
+       
+        # Partition population into species based on genetic similarity.
+        while unspeciated:
+            gid = unspeciated.pop()
+            g = population[gid]
+
+            # Find the species with the most similar representative.
+            candidates = []
+            for sid, rid in new_representatives.items():
+                rep = population[rid]
+                d = distances(rep, g)
+                if d < compatibility_threshold:
+                    candidates.append((d, sid))
+
+            if candidates:
+                ignored_sdist, sid = min(candidates, key=lambda x: x[0])
+                new_members[sid].append(gid)
+            else:
+                # No species is similar enough, create a new species, using
+                # this genome as its representative.
+                sid = next(self.indexer)
+                new_representatives[sid] = gid
+                new_members[sid] = [gid]
+                
+       	# 这里和论文里有些不一样。论文里说的是个体直接被划分到第一个距离小于阈值的物种。而这里是划分到了小于阈值里距离最小的物种。
+        # 如果没有小于阈值的物种，则创建新物种。
+        # 如此看来，当最开始一个物种都没有的时候，第一个个体直接形成了第一个物种。然后后面的个体就开始判定。
+
+        # Update species collection based on new speciation.
+        self.genome_to_species = {}
+        for sid, rid in new_representatives.items():
+            s = self.species.get(sid)
+            if s is None:
+                s = Species(sid, generation)  # generation是一个int，表示物种是在哪一代创建的
+                self.species[sid] = s
+
+            members = new_members[sid]
+            for gid in members:
+                self.genome_to_species[gid] = sid
+
+            member_dict = dict((gid, population[gid]) for gid in members)
+            s.update(population[rid], member_dict)
+
+        # Mean and std genetic distance info report
+        if len(population) > 1:
+            gdmean = mean(distances.distances.values())
+            gdstdev = stdev(distances.distances.values())
+            self.reporters.info(
+                'Mean genetic distance {0:.3f}, standard deviation {1:.3f}'.format(gdmean, gdstdev))
+
+    def get_species_id(self, individual_id):
+        return self.genome_to_species[individual_id]
+
+    def get_species(self, individual_id):
+        sid = self.genome_to_species[individual_id]
+        return self.species[sid]
+```
+
+2023.2.17 上午：
+
+看完了这段代码，做一个总结：
+
+1. 初始状态下，物种数量为0；
+2. 第一次调用speciate时，第一个个体直接成为第一个物种，并且作为这个物种的representative。后面的个体接着判定。
+3. 后续的每一次调用speciate，完成以下事情：
+   1. 为每个物种重新选定representative。因为上一代的representative genome可能已经被演化整不一样了，所以要从这一带所有人里面找一个和那个人最像的，来作为这一带该物种的representative genome。
+   2. 把其他的个体划分到物种里。这里和论文里有些不一样。论文里说的是个体直接被划分到第一个距离小于阈值的物种。而这里是划分到了小于阈值里距离最小的物种。如果没有小于阈值的物种，则创建新物种。
+
+整体来说不是很难。今天上午状态挺好的，看的比较投入。
+
+### population
+
+代码阅读的最后一部分！！！！！看了45天了都
+
+```python
+class Population(object):
+    """
+    This class implements the core evolution algorithm:
+        1. Evaluate fitness of all genomes.
+        2. Check to see if the termination criterion is satisfied; exit if it is.
+        3. Generate the next generation from the current population.
+        4. Partition the new generation into species based on genetic similarity.
+        5. Go to 1.
+    """
+
+    def __init__(self, config, initial_state=None):
+        self.reporters = ReporterSet()
+        self.config = config
+        stagnation = config.stagnation_type(config.stagnation_config, self.reporters)
+        self.reproduction = config.reproduction_type(config.reproduction_config,
+                                                     self.reporters,
+                                                     stagnation)
+        #  fitness评价标准 
+        if config.fitness_criterion == 'max':
+            self.fitness_criterion = max
+        elif config.fitness_criterion == 'min':
+            self.fitness_criterion = min
+        elif config.fitness_criterion == 'mean':
+            self.fitness_criterion = mean
+        elif not config.no_fitness_termination:
+            raise RuntimeError(
+                "Unexpected fitness_criterion: {0!r}".format(config.fitness_criterion))
+
+        if initial_state is None:
+            # Create a population from scratch, then partition into species.
+            self.population = self.reproduction.create_new(config.genome_type,
+                                                           config.genome_config,
+                                                           config.pop_size)
+            self.species = config.species_set_type(config.species_set_config, self.reporters)
+            self.generation = 0
+            self.species.speciate(config, self.population, self.generation)
+        else:
+            self.population, self.species, self.generation = initial_state
+
+        self.best_genome = None
+
+    def add_reporter(self, reporter):
+        self.reporters.add(reporter)
+
+    def remove_reporter(self, reporter):
+        self.reporters.remove(reporter)
+
+    def run(self, fitness_function, n=None):
+        """
+        Runs NEAT's genetic algorithm for at most n generations.  If n
+        is None, run until solution is found or extinction occurs.
+
+        The user-provided fitness_function must take only two arguments:
+            1. The population as a list of (genome id, genome) tuples.
+            2. The current configuration object.
+
+        The return value of the fitness function is ignored, but it must assign
+        a Python float to the `fitness` member of each genome.
+
+        The fitness function is free to maintain external state, perform
+        evaluations in parallel, etc.
+
+        It is assumed that fitness_function does not modify the list of genomes,
+        the genomes themselves (apart from updating the fitness member),
+        or the configuration object.
+        """
+
+        if self.config.no_fitness_termination and (n is None):
+            raise RuntimeError("Cannot have no generational limit with no fitness termination")
+
+        k = 0
+        while n is None or k < n:
+            k += 1
+
+            self.reporters.start_generation(self.generation)
+
+            # Evaluate all genomes using the user-provided function.
+            fitness_function(list(self.population.items()), self.config)
+
+            # Gather and report statistics.
+            best = None
+            for g in self.population.values():
+                if g.fitness is None:
+                    raise RuntimeError("Fitness not assigned to genome {}".format(g.key))
+
+                if best is None or g.fitness > best.fitness:
+                    best = g
+            self.reporters.post_evaluate(self.config, self.population, self.species, best)
+
+            # Track the best genome ever seen.
+            if self.best_genome is None or best.fitness > self.best_genome.fitness:
+                self.best_genome = best
+
+            if not self.config.no_fitness_termination:
+                # End if the fitness threshold is reached.
+                fv = self.fitness_criterion(g.fitness for g in self.population.values())
+                if fv >= self.config.fitness_threshold:
+                    self.reporters.found_solution(self.config, self.generation, best)
+                    break
+                    
+			# 上面都是分数统计。记录最高分、判断是否停止
+            # Create the next generation from the current generation.
+            self.population = self.reproduction.reproduce(self.config, self.species,
+                                                          self.config.pop_size, self.generation)
+            # reproduce产生下一代
+
+            # Check for complete extinction.
+            if not self.species.species:
+                self.reporters.complete_extinction()
+
+                # If requested by the user, create a completely new population,
+                # otherwise raise an exception.
+                if self.config.reset_on_extinction:
+                    self.population = self.reproduction.create_new(self.config.genome_type,
+                                                                   self.config.genome_config,
+                                                                   self.config.pop_size)
+                else:
+                    raise CompleteExtinctionException()
+
+            # Divide the new population into species.
+            self.species.speciate(self.config, self.population, self.generation)
+			# speciate维护新的种群
+            self.reporters.end_generation(self.config, self.population, self.species)
+
+            self.generation += 1
+
+        if self.config.no_fitness_termination:
+            self.reporters.found_solution(self.config, self.generation, self.best_genome)
+
+        return self.best_genome
+```
+
+### graph
+
+最后，关于NEAT网络计算，代码里有一些图论算法。
+
+```python
+def creates_cycle(connections, test):
+    """
+    Returns true if the addition of the 'test' connection would create a cycle,
+    assuming that no cycle already exists in the graph represented by 'connections'.
+    """
+    i, o = test
+    if i == o:
+        return True
+
+    visited = {o}
+    while True:
+        num_added = 0
+        for a, b in connections:
+            if a in visited and b not in visited:
+                if b == i:
+                    return True
+
+                visited.add(b)
+                num_added += 1
+
+        if num_added == 0:
+            return False
+```
+
+判断已有无环图connections里，如果加入了一个新的连接test($i \to o$)，是否会产生环。
+
+算法的逻辑很简单，就是从o出发，bfs搜索是否有有一条路径能到达i，如果有，那么有环。
+
+
+
+```python
+def required_for_output(inputs, outputs, connections):
+    """
+    Collect the nodes whose state is required to compute the final network output(s).
+    :param inputs: list of the input identifiers
+    :param outputs: list of the output node identifiers
+    :param connections: list of (input, output) connections in the network.
+    NOTE: It is assumed that the input identifier set and the node identifier set are disjoint.
+    By convention, the output node ids are always the same as the output index.
+
+    Returns a set of identifiers of required nodes.
+    """
+    assert not set(inputs).intersection(outputs)
+
+    required = set(outputs)
+    s = set(outputs)
+    while 1:
+        # Find nodes not in s whose output is consumed by a node in s.
+        t = set(a for (a, b) in connections if b in s and a not in s)
+
+        if not t:  # 如果没有新加入的node，break
+            break
+
+        layer_nodes = set(x for x in t if x not in inputs)
+        if not layer_nodes:  # 如果新加入的node全是input，也要break
+            break
+
+        required = required.union(layer_nodes)
+        s = s.union(t)
+
+    return required
+```
+
+判断图里哪些node在计算过程中需要用到，逻辑也不难，就是从后往前倒推就行。
+
+
+
+```python
+def feed_forward_layers(inputs, outputs, connections):
+    """
+    Collect the layers whose members can be evaluated in parallel in a feed-forward network.
+    :param inputs: list of the network input nodes
+    :param outputs: list of the output node identifiers
+    :param connections: list of (input, output) connections in the network.
+
+    Returns a list of layers, with each layer consisting of a set of node identifiers.
+    Note that the returned layers do not contain nodes whose output is ultimately
+    never used to compute the final network output.
+    """
+
+    required = required_for_output(inputs, outputs, connections)
+
+    layers = []
+    s = set(inputs)
+    while 1:
+        # Find candidate nodes c for the next layer.  These nodes should connect
+        # a node in s to a node not in s.
+        c = set(b for (a, b) in connections if a in s and b not in s)  # 先找出这一层哪些节点有可能能算出来
+        # Keep only the used nodes whose entire input set is contained in s.
+        t = set()
+        for n in c:  # not required的节点不用算，还需要判断这些点是否真的能算出来
+            if n in required and all(a in s for (a, b) in connections if b == n):
+                t.add(n)
+
+        if not t:  # 没有新的点，break
+            break
+
+        layers.append(t)  # add这一层
+        s = s.union(t)
+
+    return layers
+```
+
+找出图的计算顺序，返回的结果是 一层层的node
+
+### nn.feed_forward
+
+差点忘了，还有神经网络计算的部分。如何将由Node和Connection两种基因构成的基因组，转化成可以用来做前向计算的网络。
+
+```python
+class FeedForwardNetwork(object):
+    def __init__(self, inputs, outputs, node_evals):
+        self.input_nodes = inputs
+        self.output_nodes = outputs
+        self.node_evals = node_evals
+        self.values = dict((key, 0.0) for key in inputs + outputs)
+
+    def activate(self, inputs):
+        if len(self.input_nodes) != len(inputs):
+            raise RuntimeError("Expected {0:n} inputs, got {1:n}".format(len(self.input_nodes), len(inputs)))
+
+        for k, v in zip(self.input_nodes, inputs):
+            self.values[k] = v
+
+        for node, act_func, agg_func, bias, response, links in self.node_evals:
+            node_inputs = []
+            for i, w in links:
+                node_inputs.append(self.values[i] * w)
+            s = agg_func(node_inputs)
+            self.values[node] = act_func(bias + response * s)  # 原来response是这个用处的...
+
+        return [self.values[i] for i in self.output_nodes]
+
+    @staticmethod
+    def create(genome, config):
+        """ Receives a genome and returns its phenotype (a FeedForwardNetwork). """
+
+        # Gather expressed connections.
+        connections = [cg.key for cg in genome.connections.values() if cg.enabled]
+
+        layers = feed_forward_layers(config.genome_config.input_keys, config.genome_config.output_keys, connections)
+        # 在graph.py里的方法。用处是返回一层层的计算节点。
+        node_evals = []
+        for layer in layers:
+            for node in layer:
+                inputs = []
+                for conn_key in connections:
+                    inode, onode = conn_key
+                    if onode == node:
+                        cg = genome.connections[conn_key]
+                        inputs.append((inode, cg.weight))  # Connection的Attribute--weight
+
+                ng = genome.nodes[node]
+                aggregation_function = config.genome_config.aggregation_function_defs.get(ng.aggregation)  # 聚合方式
+                activation_function = config.genome_config.activation_defs.get(ng.activation)  # 激活函数
+                node_evals.append((node, activation_function, aggregation_function, ng.bias, ng.response, inputs))
+
+        return FeedForwardNetwork(config.genome_config.input_keys, config.genome_config.output_keys, node_evals)
+
+```
+
+
+
+## 总结
+
+2023/2/21 
+
+花了大概3个工作日的时间，终于把原版NEAT的代码看完了。现在对它的运行结构已经有了比较细致地了解。在此做一个总结。
+
+NEAT和我以前接触的演化算法不一样，在于两点。
+
+1. 之前了解的演化算法都是在优化已有模型的参数，NEAT同时优化已有模型的参数和拓扑结构。
+2. NEAT有一套物种保护机制，他将整个种群划分为不同的物种，在物种的内部进行淘汰、交叉、突变。
+
+下面细说这两点：
+
+### NeuralEvolution for Augmenting Topologies
+
+每一个个体的基因组(Genome)由两类基因构成。Node Gene和Connection Gene。如它们的名字一样，Node Gene表示网络拓扑结构中的计算单元(Node)，Connection Gene表示两个Node之间的连接(Connection)。
+
+Node Gene有以下Attributes:
+
+1. bias: float, 偏置
+2. response: float, 相应比重
+3. activation: str, 激活函数 
+4. aggregation: str, 聚合函数
+
+Connection Gene有一下Attributes:
+
+1. weight: float, 权重
+2. enable: bool, 是否启用
+
+网络计算方式:
+
+ ```python
+ for node, act_func, agg_func, bias, response, links in self.node_evals:
+     node_inputs = []
+     for i, w in links:
+         node_inputs.append(self.values[i] * w)  # w -> weight 
+         s = agg_func(node_inputs)  # 聚合函数，如sum，mean，square_sum
+         self.values[node] = act_func(bias + response * s)
+ ```
+
